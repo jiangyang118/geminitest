@@ -41,6 +41,7 @@ Notes
 - Retrieval: Q&A uses vector retrieval (OpenAI/Gemini embeddings) when available; falls back to TF‑IDF.
 - URL parsing: fetches HTML and extracts main article via Readability (falls back to plain text stripping).
 - PDF parsing: uses `pdfjs-dist` to extract per-page text.
+- Structured files: CSV/Excel(JSON array) are flattened row-wise as `col: value | ...`; SRT/VTT subtitles are merged with timestamps.
 - Storage persists to `apps/server/data/data.json`.
 - Mind map output includes a Mermaid `mindmap` block.
 

@@ -548,6 +548,82 @@ async function parsePDFBuffer(buf) {
   }
 }
 
+function parseCSVBuffer(buf) {
+  const s = buf.toString('utf8');
+  const rows = [];
+  let row = [], cell = '', inQ = false;
+  for (let i = 0; i < s.length; i++) {
+    const ch = s[i];
+    if (inQ) {
+      if (ch === '"') {
+        if (s[i + 1] === '"') { cell += '"'; i++; }
+        else { inQ = false; }
+      } else { cell += ch; }
+      continue;
+    }
+    if (ch === '"') { inQ = true; continue; }
+    if (ch === ',' || ch === '\t') { row.push(cell); cell = ''; continue; }
+    if (ch === '\n' || ch === '\r') {
+      if (cell.length || row.length) { row.push(cell); rows.push(row); row = []; cell = ''; }
+      if (ch === '\r' && s[i + 1] === '\n') i++; // CRLF
+      continue;
+    }
+    cell += ch;
+  }
+  if (cell.length || row.length) { row.push(cell); rows.push(row); }
+  // Format to text
+  let headers = null;
+  if (rows.length && rows[0].every((v) => v && v.trim().length)) headers = rows.shift();
+  const lines = rows.map((r, idx) => {
+    if (headers) return `${idx + 1}. ` + headers.map((h, i) => `${h}: ${r[i] ?? ''}`).join(' | ');
+    return `${idx + 1}. ` + r.join(' | ');
+  });
+  return lines.join('\n');
+}
+
+async function parseXLSXBuffer(buf) {
+  try {
+    const XLSX = require('xlsx');
+    const wb = XLSX.read(buf, { type: 'buffer' });
+    const ws = wb.SheetNames[0];
+    if (!ws) return '';
+    const data = XLSX.utils.sheet_to_json(wb.Sheets[ws], { defval: '' });
+    if (!Array.isArray(data) || data.length === 0) return '';
+    const headers = Object.keys(data[0]);
+    const lines = data.map((row, i) => `${i + 1}. ` + headers.map((h) => `${h}: ${row[h]}`).join(' | '));
+    return lines.join('\n');
+  } catch (e) {
+    return '';
+  }
+}
+
+function parseSRTBuffer(buf) {
+  const s = buf.toString('utf8');
+  const blocks = s.split(/\n\s*\n/);
+  const out = [];
+  for (const b of blocks) {
+    const lines = b.split(/\n/).map((x) => x.trim()).filter(Boolean);
+    if (lines.length < 2) continue;
+    const time = lines[1];
+    const txt = lines.slice(2).join(' ');
+    if (txt) out.push(`${time} ${txt}`);
+  }
+  return out.join('\n');
+}
+
+function parseVTTBuffer(buf) {
+  const s = buf.toString('utf8');
+  const lines = s.split(/\n/);
+  const out = [];
+  let cur = null;
+  for (const line of lines) {
+    if (/-->/.test(line)) { cur = line; continue; }
+    if (!line.trim()) { cur = null; continue; }
+    if (cur) out.push(`${cur} ${line.trim()}`);
+  }
+  return out.join('\n');
+}
+
 async function ensureChunkEmbeddings(db, chunks) {
   // Collect chunks without vectors
   const pending = chunks.filter((c) => !Array.isArray(c.vector));
@@ -908,13 +984,34 @@ const server = http.createServer(async (req, res) => {
         if (!filePart) return bad(res, 'No file');
         const filename = filePart.filename || 'upload.bin';
         const isPDF = /\.pdf$/i.test(filename) || /application\/pdf/.test(filePart.contentType || '');
+        const isXLSX = /\.(xlsx|xlsm)$/i.test(filename);
+        const isCSV = /\.csv$/i.test(filename);
+        const isSRT = /\.srt$/i.test(filename);
+        const isVTT = /\.vtt$/i.test(filename);
+        const isJSON = /\.json$/i.test(filename);
         let content = '';
-        if (isPDF) {
-          content = await parsePDFBuffer(filePart.data);
-        } else {
-          content = filePart.data.toString('utf8');
+        let type = 'text';
+        if (isPDF) { content = await parsePDFBuffer(filePart.data); type = 'pdf'; }
+        else if (isXLSX) { content = await parseXLSXBuffer(filePart.data); type = 'table'; }
+        else if (isCSV) { content = parseCSVBuffer(filePart.data); type = 'table'; }
+        else if (isSRT) { content = parseSRTBuffer(filePart.data); type = 'subtitle'; }
+        else if (isVTT) { content = parseVTTBuffer(filePart.data); type = 'subtitle'; }
+        else if (isJSON) {
+          try {
+            const obj = JSON.parse(filePart.data.toString('utf8'));
+            if (Array.isArray(obj)) {
+              const rows = obj;
+              const headers = Array.from(rows.reduce((set, r) => { Object.keys(r||{}).forEach(k=>set.add(k)); return set; }, new Set()));
+              content = rows.map((r,i)=> `${i+1}. ` + headers.map((h)=> `${h}: ${r?.[h] ?? ''}`).join(' | ')).join('\n');
+              type = 'table';
+            } else {
+              content = JSON.stringify(obj, null, 2);
+              type = 'text';
+            }
+          } catch { content = filePart.data.toString('utf8'); type = 'text'; }
         }
-        const src = ingestSource(db, { type: isPDF ? 'pdf' : 'text', name: name || filename, content });
+        else { content = filePart.data.toString('utf8'); type = 'text'; }
+        const src = ingestSource(db, { type, name: name || filename, content });
         await ensureChunkEmbeddings(db, src.chunks);
         if (sqliteDB && Array.isArray(src.chunks)) {
           const vectors = (src.chunks || []).filter((c) => Array.isArray(c.vector));

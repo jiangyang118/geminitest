@@ -149,7 +149,7 @@ if (fileInput) fileInput.addEventListener('change', async (e) => {
   if (!f) return;
   const nameBox = $('#src-name');
   nameBox.value ||= f.name;
-  if (/\.pdf$/i.test(f.name)){
+  if (/\.(pdf|xlsx|csv|json|srt|vtt)$/i.test(f.name)){
     await uploadToServer(f);
     return;
   }
