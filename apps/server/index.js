@@ -10,6 +10,13 @@ const PORT = process.env.PORT || 8787;
 const DATA_DIR = join(__dirname, 'data');
 const DATA_FILE = join(DATA_DIR, 'data.json');
 const STATIC_DIR = resolve(__dirname, '../web/public');
+const VECTOR_BACKEND = process.env.VECTOR_BACKEND || 'sqlite';
+const VECTOR_DB_PATH = process.env.VECTOR_DB_PATH || join(DATA_DIR, 'index.db');
+const VECTOR_DIM_ENV = parseInt(process.env.VECTOR_DIM || '', 10) || null;
+
+function tryRequire(name) {
+  try { return require(name); } catch (e) { return null; }
+}
 
 function ensureData() {
   if (!existsSync(DATA_DIR)) mkdirSync(DATA_DIR, { recursive: true });
@@ -88,6 +95,15 @@ function contentTypeByExt(p) {
       '.md': 'text/markdown; charset=utf-8',
     }[ext] || 'application/octet-stream'
   );
+}
+
+async function readRawBody(req) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    req.on('data', (c) => chunks.push(c));
+    req.on('end', () => resolve(Buffer.concat(chunks)));
+    req.on('error', reject);
+  });
 }
 
 // Naive text utilities
@@ -173,6 +189,50 @@ function retrieveTopChunks(query, sources, k = 8) {
   return scored.slice(0, k).map((x) => x.c);
 }
 
+// Multipart parser (simple)
+function parseMultipart(body, boundary) {
+  const parts = [];
+  const dash = Buffer.from('--' + boundary);
+  const end = Buffer.from('--' + boundary + '--');
+  let idx = body.indexOf(dash);
+  if (idx === -1) return parts;
+  idx += dash.length + 2; // skip initial CRLF
+  while (idx < body.length) {
+    const nextDash = body.indexOf(dash, idx);
+    const nextEnd = body.indexOf(end, idx);
+    const next = nextDash === -1 ? nextEnd : Math.min(nextDash, nextEnd);
+    if (next === -1) break;
+    let part = body.slice(idx, next);
+    // Trim leading CRLF
+    if (part[0] === 13 && part[1] === 10) part = part.slice(2);
+    // Split headers and data
+    const sep = Buffer.from('\r\n\r\n');
+    const hEnd = part.indexOf(sep);
+    if (hEnd === -1) break;
+    const hBuf = part.slice(0, hEnd);
+    let dBuf = part.slice(hEnd + 4);
+    // Trim trailing CRLF
+    if (dBuf[dBuf.length - 2] === 13 && dBuf[dBuf.length - 1] === 10) dBuf = dBuf.slice(0, -2);
+    const headers = hBuf.toString('utf8').split(/\r\n/);
+    const disp = headers.find((h) => /^content-disposition/i.test(h)) || '';
+    const ctype = headers.find((h) => /^content-type/i.test(h)) || '';
+    const nameMatch = disp.match(/name="([^"]+)"/i);
+    const fileMatch = disp.match(/filename="([^"]*)"/i);
+    const item = {
+      name: nameMatch ? nameMatch[1] : undefined,
+      filename: fileMatch ? fileMatch[1] : undefined,
+      contentType: ctype.split(':')[1]?.trim(),
+      data: dBuf,
+    };
+    if (!item.filename) {
+      item.text = dBuf.toString('utf8');
+    }
+    parts.push(item);
+    idx = next + dash.length + 2; // skip to after boundary CRLF
+  }
+  return parts;
+}
+
 // Simple in-memory LLM fallback (deterministic) if no API keys
 async function mockLLMGenerate({ system, user, format = 'text' }) {
   const prompt = [system, user].filter(Boolean).join('\n\n');
@@ -233,6 +293,129 @@ async function llmGenerate({ system, user, expect = 'text' }) {
   const gemini = await googleGenAI([system, user].filter(Boolean).join('\n\n'), { json: expect === 'json' });
   if (gemini) return gemini;
   return mockLLMGenerate({ system, user, format: expect });
+}
+
+// Embeddings
+function normalizeVec(vec) {
+  let norm = 0;
+  for (const v of vec) norm += v * v;
+  norm = Math.sqrt(norm) || 1;
+  return vec.map((v) => v / norm);
+}
+
+function hashNgrams(text, dim = 768) {
+  const v = new Float32Array(dim);
+  const s = (text || '').toLowerCase();
+  const n = 3;
+  for (let i = 0; i < s.length - n + 1; i++) {
+    const g = s.slice(i, i + n);
+    let h = 2166136261;
+    for (let j = 0; j < g.length; j++) {
+      h ^= g.charCodeAt(j);
+      h += (h << 1) + (h << 4) + (h << 7) + (h << 8) + (h << 24);
+    }
+    const idx = Math.abs(h) % dim;
+    v[idx] += 1;
+  }
+  return Array.from(normalizeVec(Array.from(v)));
+}
+
+async function openaiEmbedBatch(texts, { model = 'text-embedding-3-small' } = {}) {
+  const key = process.env.OPENAI_API_KEY;
+  if (!key) return null;
+  try {
+    const r = await fetch('https://api.openai.com/v1/embeddings', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${key}` },
+      body: JSON.stringify({ input: texts, model })
+    });
+    if (!r.ok) throw new Error(`OpenAI Embeddings ${r.status}`);
+    const data = await r.json();
+    const embeds = data.data?.map((d) => d.embedding);
+    const dim = embeds?.[0]?.length || 0;
+    return { vectors: embeds, dim, provider: model };
+  } catch (e) {
+    return null;
+  }
+}
+
+async function geminiEmbedBatch(texts, { model = 'text-embedding-004' } = {}) {
+  const key = process.env.GOOGLE_GENAI_API_KEY;
+  if (!key) return null;
+  try {
+    // Try batch endpoint
+    const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:batchEmbedContents?key=${key}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ requests: texts.map((t) => ({ content: { parts: [{ text: t }] } })) })
+    });
+    if (!r.ok) throw new Error(`Gemini Embeddings ${r.status}`);
+    const data = await r.json();
+    const embeds = data.embeddings?.map((e) => e.values) || [];
+    const dim = embeds?.[0]?.length || 0;
+    return { vectors: embeds, dim, provider: model };
+  } catch (e) {
+    // Fallback: single calls
+    try {
+      const vectors = [];
+      let dim = 0;
+      for (const t of texts) {
+        const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:embedContent?key=${key}`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ content: { parts: [{ text: t }] } })
+        });
+        if (!r.ok) throw new Error(`Gemini Embeddings single ${r.status}`);
+        const data = await r.json();
+        const v = data.embedding?.values || [];
+        dim = dim || v.length;
+        vectors.push(v);
+      }
+      return { vectors, dim, provider: model };
+    } catch (e2) {
+      return null;
+    }
+  }
+}
+
+async function embedBatch(texts, db) {
+  // Prefer OpenAI, then Gemini, else local hash
+  const openai = await openaiEmbedBatch(texts);
+  if (openai) return openai;
+  const gemini = await geminiEmbedBatch(texts);
+  if (gemini) return gemini;
+  const dim = 768;
+  return { vectors: texts.map((t) => hashNgrams(t, dim)), dim, provider: 'local-hash-3gram' };
+}
+
+async function embedWithProvider(texts, provider) {
+  if (!provider || provider === 'local-hash-3gram') {
+    const dim = 768;
+    return { vectors: texts.map((t) => hashNgrams(t, dim)), dim, provider: 'local-hash-3gram' };
+  }
+  if (/text-embedding-3/.test(provider)) {
+    const r = await openaiEmbedBatch(texts, { model: provider });
+    if (r) return r;
+    // Fallback: local to avoid dimension mismatch
+    const dim = 768;
+    return { vectors: texts.map((t) => hashNgrams(t, dim)), dim, provider: 'local-hash-3gram' };
+  }
+  if (/text-embedding-004/.test(provider)) {
+    const r = await geminiEmbedBatch(texts, { model: provider });
+    if (r) return r;
+    const dim = 768;
+    return { vectors: texts.map((t) => hashNgrams(t, dim)), dim, provider: 'local-hash-3gram' };
+  }
+  // Unknown provider: fallback local
+  const dim = 768;
+  return { vectors: texts.map((t) => hashNgrams(t, dim)), dim, provider: 'local-hash-3gram' };
+}
+
+function cosineVec(a, b) {
+  let dot = 0, na = 0, nb = 0;
+  const L = Math.min(a.length, b.length);
+  for (let i = 0; i < L; i++) { const x = a[i] || 0, y = b[i] || 0; dot += x * y; na += x * x; nb += y * y; }
+  return na && nb ? dot / Math.sqrt(na * nb) : 0;
 }
 
 // Ingestion: naive chunking and metadata
@@ -313,6 +496,233 @@ function buildPromptFromContexts({ question, chunks, sources }) {
     .join('\n\n');
   const user = `问题：${question}\n\n约束：\n- 仅使用给定片段作为证据\n- 回答要点化、条理化，避免臆测\n\n输出：\n1) 严谨回答（带关键依据）\n2) 多层次总结（短/中/长）\n3) 不同受众版本（学生/专家/儿童）\n4) 用中文回答。`;
   return { system: header, user: `${ctx}\n\n${user}` };
+}
+
+// URL & PDF parsing
+async function parseURLToText(url) {
+  try {
+    const r = await fetch(url, { headers: { 'User-Agent': 'NotebookLM-Web/0.1' } });
+    const html = await r.text();
+    let title = '';
+    try {
+      const { JSDOM } = require('jsdom');
+      const { Readability } = require('@mozilla/readability');
+      const dom = new JSDOM(html, { url });
+      title = dom.window.document.title || '';
+      const reader = new Readability(dom.window.document);
+      const article = reader.parse();
+      if (article?.textContent) return { title: article.title || title, text: article.textContent };
+    } catch (e) {
+      // Fallback: strip tags
+    }
+    const text = html.replace(/<script[\s\S]*?<\/script>/gi, ' ').replace(/<style[\s\S]*?<\/style>/gi, ' ').replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
+    return { title, text };
+  } catch (e) {
+    return { title: '', text: '' };
+  }
+}
+
+async function fetchBinary(url) {
+  const r = await fetch(url);
+  if (!r.ok) throw new Error(`Fetch ${r.status}`);
+  const ab = await r.arrayBuffer();
+  return Buffer.from(ab);
+}
+
+async function parsePDFBuffer(buf) {
+  try {
+    const pdfjsLib = require('pdfjs-dist/legacy/build/pdf.js');
+    const data = new Uint8Array(buf);
+    const task = pdfjsLib.getDocument({ data });
+    const pdf = await task.promise;
+    const pages = [];
+    for (let i = 1; i <= pdf.numPages; i++) {
+      const page = await pdf.getPage(i);
+      const tc = await page.getTextContent();
+      const strings = tc.items.map((it) => it.str).filter(Boolean);
+      pages.push(strings.join(' '));
+    }
+    return pages.join('\n\n');
+  } catch (e) {
+    return '';
+  }
+}
+
+async function ensureChunkEmbeddings(db, chunks) {
+  // Collect chunks without vectors
+  const pending = chunks.filter((c) => !Array.isArray(c.vector));
+  if (pending.length === 0) return db;
+  const texts = pending.map((c) => c.text.slice(0, 2000));
+  const emb = db.embedding ? await embedWithProvider(texts, db.embedding.provider) : await embedBatch(texts, db);
+  const { vectors, dim, provider } = emb;
+  if (!db.embedding) db.embedding = { provider, dim };
+  if (db.embedding.dim !== dim || db.embedding.provider !== provider) db.embedding = { provider, dim };
+  pending.forEach((c, i) => { c.vector = vectors[i]; });
+  saveData(db);
+  return db;
+}
+
+function retrieveTopChunksVector(query, sources, db, k = 12) {
+  const chunks = sources.flatMap((s) => s.chunks || []);
+  if (!db.embedding || chunks.length === 0 || !chunks[0].vector) return null;
+  return (async () => {
+    const emb = db.embedding ? await embedWithProvider([query], db.embedding.provider) : await embedBatch([query], db);
+    const { vectors, dim } = emb;
+    const qv = vectors[0];
+    const scored = chunks
+      .filter((c) => Array.isArray(c.vector) && c.vector.length === (db.embedding?.dim || dim))
+      .map((c) => ({ c, score: cosineVec(c.vector, qv) }));
+    scored.sort((a, b) => b.score - a.score);
+    return scored.slice(0, k).map((x) => x.c);
+  })();
+}
+
+// --- SQLite vector index backend ---
+let sqliteDB = null;
+function initSQLite() {
+  const mod = tryRequire('better-sqlite3');
+  if (!mod) return null;
+  ensureData();
+  const db = new mod(VECTOR_DB_PATH);
+  try { db.pragma('journal_mode = WAL'); } catch {}
+  db.exec(
+    `CREATE TABLE IF NOT EXISTS chunk_vectors (
+      chunk_id TEXT PRIMARY KEY,
+      source_id TEXT,
+      text TEXT,
+      vector BLOB,
+      dim INTEGER,
+      updated_at TEXT
+    );`
+  );
+  return db;
+}
+
+function encVec(vec) {
+  const buf = Buffer.allocUnsafe(vec.length * 4);
+  const view = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
+  for (let i = 0; i < vec.length; i++) view.setFloat32(i * 4, vec[i], true);
+  return buf;
+}
+function decVec(buf) {
+  const view = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
+  const n = Math.floor(buf.byteLength / 4);
+  const out = new Array(n);
+  for (let i = 0; i < n; i++) out[i] = view.getFloat32(i * 4, true);
+  return out;
+}
+
+function sqliteUpsertChunkVectors(rows) {
+  if (!sqliteDB) return;
+  const stmt = sqliteDB.prepare(
+    `INSERT INTO chunk_vectors (chunk_id, source_id, text, vector, dim, updated_at)
+     VALUES (@chunk_id, @source_id, @text, @vector, @dim, @updated_at)
+     ON CONFLICT(chunk_id) DO UPDATE SET
+       source_id=excluded.source_id,
+       text=excluded.text,
+       vector=excluded.vector,
+       dim=excluded.dim,
+       updated_at=excluded.updated_at`
+  );
+  const tx = sqliteDB.transaction((arr) => { for (const r of arr) stmt.run(r); });
+  tx(rows.map((r) => ({
+    chunk_id: r.id,
+    source_id: r.sourceId,
+    text: r.text,
+    vector: encVec(r.vector),
+    dim: r.dim,
+    updated_at: new Date().toISOString(),
+  })));
+}
+
+function sqliteQueryTopKByVector(sourceIds, qv, k) {
+  if (!sqliteDB) return [];
+  const hasFilter = Array.isArray(sourceIds) && sourceIds.length > 0;
+  const where = hasFilter ? `WHERE source_id IN (${sourceIds.map(() => '?').join(',')})` : '';
+  const rows = sqliteDB.prepare(`SELECT chunk_id, source_id, text, vector, dim FROM chunk_vectors ${where}`).all(...(hasFilter ? sourceIds : []));
+  const scored = [];
+  for (const r of rows) {
+    if (!r.vector) continue;
+    const v = decVec(r.vector);
+    const score = cosineVec(v, qv);
+    scored.push({ id: r.chunk_id, sourceId: r.source_id, text: r.text, score });
+  }
+  scored.sort((a, b) => b.score - a.score);
+  return scored.slice(0, k);
+}
+
+function sqliteCount() {
+  if (!sqliteDB) return 0;
+  try { return sqliteDB.prepare('SELECT COUNT(*) as c FROM chunk_vectors').get().c || 0; } catch { return 0; }
+}
+
+function sqliteReset() {
+  if (!sqliteDB) return;
+  try { sqliteDB.exec('DELETE FROM chunk_vectors'); } catch {}
+}
+
+// --- Postgres pgvector backend (optional) ---
+let pgClient = null;
+let PG_DIM = VECTOR_DIM_ENV || 1536;
+async function initPgVector() {
+  const pg = tryRequire('pg');
+  if (!pg) return null;
+  const url = process.env.DATABASE_URL;
+  if (!url) return null;
+  const client = new pg.Client({ connectionString: url });
+  try {
+    await client.connect();
+    // Table with pgvector type; assumes extension installed
+    const dim = PG_DIM;
+    await client.query(`CREATE TABLE IF NOT EXISTS chunk_vectors (
+      chunk_id TEXT PRIMARY KEY,
+      source_id TEXT,
+      text TEXT,
+      embedding vector(${dim}),
+      updated_at TIMESTAMPTZ DEFAULT now()
+    );`);
+    return client;
+  } catch (e) {
+    try { await client.end(); } catch {}
+    return null;
+  }
+}
+
+async function pgUpsertChunkVectors(rows) {
+  if (!pgClient) return;
+  const text = `INSERT INTO chunk_vectors (chunk_id, source_id, text, embedding, updated_at)
+                VALUES ($1,$2,$3,$4::vector, now())
+                ON CONFLICT (chunk_id) DO UPDATE SET
+                  source_id = EXCLUDED.source_id,
+                  text = EXCLUDED.text,
+                  embedding = EXCLUDED.embedding,
+                  updated_at = now()`;
+  for (const r of rows) {
+    const vec = '[' + r.vector.map((x) => (Number.isFinite(x) ? x : 0)).join(',') + ']';
+    try { await pgClient.query(text, [r.id, r.sourceId, r.text, vec]); } catch (e) { /* ignore */ }
+  }
+}
+
+async function pgQueryTopKByVector(sourceIds, qv, k) {
+  if (!pgClient) return [];
+  const qvec = '[' + qv.map((x) => (Number.isFinite(x) ? x : 0)).join(',') + ']';
+  const filter = Array.isArray(sourceIds) && sourceIds.length ? `WHERE source_id = ANY($3)` : '';
+  const sql = `SELECT chunk_id, source_id, text FROM chunk_vectors ${filter}
+               ORDER BY embedding <#> $1::vector LIMIT $2`;
+  const params = Array.isArray(sourceIds) && sourceIds.length ? [qvec, k, sourceIds] : [qvec, k];
+  const r = await pgClient.query(sql, params);
+  return r.rows.map((row) => ({ id: row.chunk_id, sourceId: row.source_id, text: row.text }));
+}
+
+async function pgCount() {
+  if (!pgClient) return 0;
+  const r = await pgClient.query('SELECT COUNT(*)::int AS c FROM chunk_vectors');
+  return r.rows[0]?.c || 0;
+}
+
+async function pgReset() {
+  if (!pgClient) return;
+  await pgClient.query('TRUNCATE TABLE chunk_vectors');
 }
 
 function buildGeneratorPrompt(type, { sources, options = {} }) {
@@ -453,7 +863,70 @@ const server = http.createServer(async (req, res) => {
       if (req.method === 'POST' && path === '/api/sources') {
         const payload = await readJson(req).catch(() => null);
         if (!payload || !payload.type) return bad(res, 'Missing type');
+        // Enrich content for URL/PDF
+        if (payload.type === 'url' && payload.url) {
+          const parsed = await parseURLToText(payload.url);
+          payload.content = parsed.text || payload.content;
+          payload.name = payload.name || parsed.title || payload.url;
+        }
+        if (payload.type === 'pdf' && payload.url) {
+          try {
+            const bin = await fetchBinary(payload.url);
+            payload.content = await parsePDFBuffer(bin);
+          } catch (e) {
+            // leave content as-is
+          }
+        }
         const src = ingestSource(db, payload);
+        // Build embeddings for new chunks (if provider available)
+        await ensureChunkEmbeddings(db, src.chunks);
+        if (sqliteDB && Array.isArray(src.chunks)) {
+          const vectors = (src.chunks || []).filter((c) => Array.isArray(c.vector));
+          const dim = db.embedding?.dim || (vectors[0]?.vector?.length || null);
+          if (vectors.length && dim) {
+            sqliteUpsertChunkVectors(vectors.map((c) => ({ id: c.id, sourceId: c.sourceId, text: c.text, vector: c.vector, dim })));
+          }
+        }
+        if (pgClient && Array.isArray(src.chunks)) {
+          const vectors = (src.chunks || []).filter((c) => Array.isArray(c.vector));
+          if (vectors.length) await pgUpsertChunkVectors(vectors.map((c) => ({ id: c.id, sourceId: c.sourceId, text: c.text, vector: c.vector })));
+        }
+        saveData(db);
+        return ok(res, { source: src });
+      }
+
+      if (req.method === 'POST' && path === '/api/sources/upload') {
+        const ctype = req.headers['content-type'] || '';
+        const match = ctype.match(/boundary=(.*)$/);
+        if (!match) return bad(res, 'Missing multipart boundary');
+        const boundary = match[1];
+        const body = await readRawBody(req);
+        const parts = parseMultipart(body, boundary);
+        let filePart = parts.find((p) => p.filename);
+        let namePart = parts.find((p) => p.name === 'name');
+        const name = namePart ? namePart.text : undefined;
+        if (!filePart) return bad(res, 'No file');
+        const filename = filePart.filename || 'upload.bin';
+        const isPDF = /\.pdf$/i.test(filename) || /application\/pdf/.test(filePart.contentType || '');
+        let content = '';
+        if (isPDF) {
+          content = await parsePDFBuffer(filePart.data);
+        } else {
+          content = filePart.data.toString('utf8');
+        }
+        const src = ingestSource(db, { type: isPDF ? 'pdf' : 'text', name: name || filename, content });
+        await ensureChunkEmbeddings(db, src.chunks);
+        if (sqliteDB && Array.isArray(src.chunks)) {
+          const vectors = (src.chunks || []).filter((c) => Array.isArray(c.vector));
+          const dim = db.embedding?.dim || (vectors[0]?.vector?.length || null);
+          if (vectors.length && dim) {
+            sqliteUpsertChunkVectors(vectors.map((c) => ({ id: c.id, sourceId: c.sourceId, text: c.text, vector: c.vector, dim })));
+          }
+        }
+        if (pgClient && Array.isArray(src.chunks)) {
+          const vectors = (src.chunks || []).filter((c) => Array.isArray(c.vector));
+          if (vectors.length) await pgUpsertChunkVectors(vectors.map((c) => ({ id: c.id, sourceId: c.sourceId, text: c.text, vector: c.vector })));
+        }
         saveData(db);
         return ok(res, { source: src });
       }
@@ -462,7 +935,33 @@ const server = http.createServer(async (req, res) => {
         const { question, sourceIds, topK } = await readJson(req).catch(() => ({}));
         if (!question) return bad(res, 'Missing question');
         const sources = findSources(db, sourceIds);
-        const chunks = retrieveTopChunks(question, sources, Math.max(4, Math.min(20, topK || 12)));
+        // Ensure embeddings for selected sources (if possible)
+        await ensureChunkEmbeddings(db, sources.flatMap((s) => s.chunks || []));
+        const k = Math.max(4, Math.min(32, topK || 12));
+        let chunks = null;
+        // Prefer DB-backed vector search (pgvector → sqlite)
+        if (pgClient && db.embedding) {
+          const emb = db.embedding ? await embedWithProvider([question], db.embedding.provider) : await embedBatch([question], db);
+          const qv = emb.vectors[0];
+          const ids = sources.map((s) => s.id);
+          const rows = await pgQueryTopKByVector(ids, qv, k);
+          if (rows && rows.length) {
+            chunks = rows.map((r, i) => ({ id: r.id, index: i, text: r.text, sourceId: r.sourceId }));
+          }
+        } else if (sqliteDB && db.embedding) {
+          const emb = db.embedding ? await embedWithProvider([question], db.embedding.provider) : await embedBatch([question], db);
+          const qv = emb.vectors[0];
+          const ids = sources.map((s) => s.id);
+          const rows = sqliteQueryTopKByVector(ids, qv, k);
+          if (rows && rows.length) {
+            chunks = rows.map((r, i) => ({ id: r.id, index: i, text: r.text, sourceId: r.sourceId }));
+          }
+        }
+        if (!chunks) {
+          const maybeVec = await retrieveTopChunksVector(question, sources, db, k);
+          if (maybeVec && Array.isArray(maybeVec)) chunks = maybeVec;
+        }
+        if (!chunks) chunks = retrieveTopChunks(question, sources, k);
         const { system, user } = buildPromptFromContexts({ question, chunks, sources });
         const base = await llmGenerate({ system, user, expect: 'text' });
         const citedSources = sources.filter((s) => chunks.some((c) => c.sourceId === s.id));
@@ -484,6 +983,47 @@ const server = http.createServer(async (req, res) => {
           notes: 'LLM 不可用时的占位摘要',
         };
         return ok(res, { id: src.id, name: src.name, summary: out || naive });
+      }
+
+      if (req.method === 'POST' && path === '/api/reindex') {
+        const { provider, batch } = await readJson(req).catch(() => ({}));
+        const B = Math.max(8, Math.min(256, batch || 64));
+        const all = db.sources.flatMap((s) => s.chunks || []);
+        // Reset vectors if provider requested differs
+        if (provider && db.embedding?.provider !== provider) {
+          db.sources.forEach((s) => (s.chunks || []).forEach((c) => delete c.vector));
+          delete db.embedding;
+          sqliteReset();
+          await pgReset();
+        }
+        // Identify pending
+        const pending = all.filter((c) => !Array.isArray(c.vector));
+        let done = 0;
+        while (done < pending.length) {
+          const slice = pending.slice(done, done + B);
+          const texts = slice.map((c) => c.text.slice(0, 2000));
+          const emb = db.embedding ? await embedWithProvider(texts, db.embedding.provider) : (provider ? await embedWithProvider(texts, provider) : await embedBatch(texts, db));
+          const { vectors, dim, provider: used } = emb;
+          if (!db.embedding) db.embedding = { provider: used, dim };
+          if (sqliteDB) {
+            sqliteUpsertChunkVectors(slice.map((c, i) => ({ id: c.id, sourceId: c.sourceId, text: c.text, vector: vectors[i], dim })));
+          }
+          if (pgClient) {
+            await pgUpsertChunkVectors(slice.map((c, i) => ({ id: c.id, sourceId: c.sourceId, text: c.text, vector: vectors[i] })));
+          }
+          slice.forEach((c, i) => (c.vector = vectors[i]));
+          done += slice.length;
+          saveData(db);
+        }
+        return ok(res, { ok: true, total: all.length, indexed: all.length - pending.length + pending.length, provider: db.embedding?.provider, dim: db.embedding?.dim, backend: sqliteDB ? 'sqlite' : 'memory' });
+      }
+
+      if (req.method === 'GET' && path === '/api/index/status') {
+        const total = db.sources.reduce((n, s) => n + (s.chunks?.length || 0), 0);
+        const withVec = db.sources.reduce((n, s) => n + (s.chunks?.filter((c) => Array.isArray(c.vector)).length || 0), 0);
+        const rows = sqliteCount();
+        const pgrows = pgClient ? await pgCount() : 0;
+        return ok(res, { totalChunks: total, withVectors: withVec, sqliteRows: rows, pgRows: pgrows, embedding: db.embedding || null, backend: pgClient ? 'pgvector' : (sqliteDB ? 'sqlite' : 'memory') });
       }
 
       if (req.method === 'POST' && path === '/api/generate') {
@@ -524,5 +1064,17 @@ const server = http.createServer(async (req, res) => {
 });
 
 server.listen(PORT, () => {
-  console.log(`NotebookLM-like server running at http://localhost:${PORT}`);
+  (async () => {
+    if (VECTOR_BACKEND === 'pgvector') {
+      pgClient = await initPgVector();
+      if (pgClient) console.log('[vector] pgvector backend connected');
+      else console.log('[vector] pgvector unavailable (missing pg or connection failed)');
+    }
+    if (VECTOR_BACKEND === 'sqlite' || (!pgClient && VECTOR_BACKEND !== 'none')) {
+      sqliteDB = initSQLite();
+      if (sqliteDB) console.log(`[vector] SQLite index at ${VECTOR_DB_PATH}`);
+      else console.log('[vector] SQLite not available (better-sqlite3 not installed).');
+    }
+    console.log(`NotebookLM-like server running at http://localhost:${PORT}`);
+  })();
 });

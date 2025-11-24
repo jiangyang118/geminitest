@@ -9,7 +9,10 @@
 <body>
   <header class="topbar">
     <div class="brand">NotebookLM-style</div>
-    <div class="status" id="status">就绪</div>
+    <div style="display:flex;gap:8px;align-items:center;">
+      <button id="btn-reindex" title="重建向量索引">重建索引</button>
+      <div class="status" id="status">就绪</div>
+    </div>
   </header>
   <main class="layout">
     <aside class="sidebar">
@@ -26,8 +29,8 @@
           </label>
           <label id="content-wrap"><textarea id="src-content" rows="6" placeholder="在此粘贴文本内容"></textarea></label>
           <label id="url-wrap" style="display:none;"><input id="src-url" placeholder="https://..." /></label>
-          <label>或上传文件（txt/md/srt/vtt/csv）
-            <input id="file-input" type="file" accept=".txt,.md,.srt,.vtt,.csv,.json" />
+          <label>或上传文件（pdf/txt/md/srt/vtt/csv）
+            <input id="file-input" type="file" accept=".pdf,.txt,.md,.srt,.vtt,.csv,.json" />
           </label>
           <button id="btn-add-src">添加来源</button>
         </div>

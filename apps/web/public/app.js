@@ -130,15 +130,32 @@ loadSources().catch((e)=> setStatus('加载失败: ' + e.message));
 
 // File upload: read as text and put into textarea
 const fileInput = document.getElementById('file-input');
+async function uploadToServer(file){
+  try{
+    setStatus('上传并解析中...');
+    const fd = new FormData();
+    fd.append('file', file);
+    const name = $('#src-name').value.trim();
+    if (name) fd.append('name', name);
+    const r = await fetch('/api/sources/upload', { method: 'POST', body: fd });
+    if (!r.ok) throw new Error(`${r.status} ${r.statusText}`);
+    await r.json();
+    setStatus('解析完成');
+    loadSources();
+  }catch(e){ setStatus('上传失败: ' + e.message); }
+}
 if (fileInput) fileInput.addEventListener('change', async (e) => {
   const f = e.target.files && e.target.files[0];
   if (!f) return;
   const nameBox = $('#src-name');
   nameBox.value ||= f.name;
+  if (/\.pdf$/i.test(f.name)){
+    await uploadToServer(f);
+    return;
+  }
   const reader = new FileReader();
   reader.onload = () => {
     const text = reader.result || '';
-    // CSV: keep as-is (UI renders plain text); could convert to Markdown here
     $('#src-content').value = typeof text === 'string' ? text : '';
     $('#src-type').value = 'text';
     document.getElementById('content-wrap').style.display='';
@@ -181,4 +198,14 @@ document.getElementById('source-list').addEventListener('click', async (e)=>{
   } catch (err) {
     hint.textContent = '摘要失败';
   }
+});
+
+// Reindex button
+document.getElementById('btn-reindex').addEventListener('click', async ()=>{
+  if (!confirm('将重建缺失的向量索引（可能消耗API配额）。是否继续？')) return;
+  try{
+    setStatus('重建索引中...');
+    const out = await api('/api/reindex', { method: 'POST', body: JSON.stringify({ batch: 64 }) });
+    setStatus(`索引完成: provider=${out.provider}, dim=${out.dim}`);
+  } catch(e){ setStatus('重建失败: ' + e.message); }
 });
