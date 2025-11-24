@@ -53,6 +53,52 @@
       </section>
 
       <section class="card">
+        <h2>Flow 编排</h2>
+        <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
+          <label>选择流程
+            <select id="flow-id">
+              <option value="summary_slides_quiz">摘要 → PPT → 测验</option>
+            </select>
+          </label>
+          <label>幻灯片模板
+            <select id="flow-slides-template">
+              <option value="商务">商务</option>
+              <option value="简洁">简洁</option>
+              <option value="学术">学术</option>
+              <option value="蓝色系">蓝色系</option>
+              <option value="红色系">红色系</option>
+            </select>
+          </label>
+          <label style="min-width:260px;flex:1;">步骤（逗号分隔）
+            <input id="steps-input" placeholder="summary,slides,quiz" value="summary,slides,quiz" />
+          </label>
+          <button id="btn-run-flow">运行 Flow</button>
+          <button id="btn-run-steps">运行自定义步骤</button>
+          <button id="btn-copy-flow">复制全部</button>
+          <button id="btn-dl-flow">下载为 Markdown</button>
+          <button id="btn-dl-flow-json">下载 Flow JSON</button>
+          <button id="btn-save-defaults" title="保存为默认设置">设为默认</button>
+        </div>
+        <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-top:6px;">
+          <input id="preset-name" placeholder="预设名称（保存为预设）" style="flex:1;min-width:200px;" />
+          <button id="btn-save-preset">保存为预设</button>
+          <label>预设
+            <select id="preset-select"></select>
+          </label>
+          <button id="btn-del-preset" title="删除选中预设">删除预设</button>
+          <button id="btn-update-preset" title="用当前设置更新预设">更新预设</button>
+          <label><input type="checkbox" id="batch-per-source" /> 逐条来源批跑</label>
+          <button id="btn-run-preset">运行预设</button>
+          <button id="btn-dl-batch">下载批处理结果</button>
+          <button id="btn-dl-batch-json">下载批处理 JSON</button>
+          <button id="btn-load-jobs">查看最近任务</button>
+        </div>
+        <div id="flow-output" class="gen-output" style="margin-top:8px;"></div>
+        <div id="batch-output" class="gen-output" style="margin-top:8px;"></div>
+        <div id="jobs-output" class="gen-output" style="margin-top:8px;"></div>
+      </section>
+
+      <section class="card">
         <h2>生成器 Generators</h2>
         <div class="gen-actions">
           <button data-type="audio_overview">音频概览</button>

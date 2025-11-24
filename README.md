@@ -14,11 +14,12 @@ Environment (optional)
 - `OPENAI_API_KEY` for OpenAI Chat Completions
 - `GOOGLE_GENAI_API_KEY` for Google Generative Language API
   - Embeddings: OpenAI `text-embedding-3-small` or Gemini `text-embedding-004`
- - Vector index backend:
-   - `VECTOR_BACKEND=sqlite` (default) — stores vectors in `apps/server/data/index.db`
-   - `VECTOR_DB_PATH=/path/to/index.db` — override sqlite DB path
-   - `VECTOR_BACKEND=pgvector` with `DATABASE_URL=postgres://...` (optional; requires pgvector extension installed)
-   - `VECTOR_DIM=1536` — when using Postgres pgvector, set to match embedding dimension
+- Vector index backend:
+  - `VECTOR_BACKEND=sqlite` (default) — stores vectors in `apps/server/data/index.db`
+  - `VECTOR_DB_PATH=/path/to/index.db` — override sqlite DB path
+  - `VECTOR_BACKEND=pgvector` with `DATABASE_URL=postgres://...` (optional; requires pgvector extension installed)
+  - `VECTOR_DIM=1536` — when using Postgres pgvector, set to match embedding dimension
+ - `.env` support: add variables to a `.env` at repo root (loaded via dotenv)
 
 API Endpoints
 - GET `/api/sources` — List sources
@@ -35,7 +36,23 @@ API Endpoints
 - POST `/api/reindex` — Rebuild chunk embeddings with current provider
   - Body: `{ provider?: string, batch?: number }`
   - Re-embeds pending chunks in batches; persists to SQLite index if enabled
- - GET `/api/index/status` — Index stats `{ totalChunks, withVectors, sqliteRows, embedding, backend }`
+- GET `/api/index/status` — Index stats `{ totalChunks, withVectors, sqliteRows, embedding, backend }`
+- GET `/api/flows` — List available flows
+- POST `/api/flows/run` — Run a flow
+  - Body: `{ flowId?: 'summary_slides_quiz', steps?: string[], sourceIds: string[], options?: object }`
+  - Output: `{ id, steps: [{ id, output: { text }, citations: [...] }], aggregateCitations, sources }`
+- Flow presets
+  - GET `/api/flows/presets` — List presets
+  - POST `/api/flows/presets` — Create `{ name, steps, options }`
+  - PUT `/api/flows/presets/:id` — Update `{ name?, steps?, options? }`
+  - DELETE `/api/flows/presets/:id` — Remove
+- Batch runs
+  - POST `/api/flows/run-batch` — `{ jobs: [{ presetId?|flowId?, steps?, options?, sourceIds: string[] }], sequential?: boolean }`
+  - GET `/api/jobs` — Recent jobs
+  - GET `/api/jobs/:id` — Job detail
+- Settings
+  - GET `/api/settings` — Get preferences
+  - POST `/api/settings` — Update preferences (e.g., default flow/preset/template)
 
 Notes
 - Retrieval: Q&A uses vector retrieval (OpenAI/Gemini embeddings) when available; falls back to TF‑IDF.
@@ -44,6 +61,7 @@ Notes
 - Structured files: CSV/Excel(JSON array) are flattened row-wise as `col: value | ...`; SRT/VTT subtitles are merged with timestamps.
 - Storage persists to `apps/server/data/data.json`.
 - Mind map output includes a Mermaid `mindmap` block.
+ - Health/meta: `GET /api/health`, `GET /api/meta` for runtime info.
 
 Postgres pgvector (optional)
 - Requires `CREATE EXTENSION vector;`
@@ -70,3 +88,4 @@ Next Steps (suggested)
 - Add user auth + multi-space workspaces.
 - Add streaming responses and better UI (Mermaid render, copy/export buttons).
 - Flows/orchestration: compose multi-step tasks (e.g., Summarize → Slides → Quiz) with saved presets.
+  - Current: includes a built-in `summary → slides → quiz` flow. Extend with custom flows, saved presets, and scheduling.

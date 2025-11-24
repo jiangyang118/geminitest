@@ -3,6 +3,7 @@
 // - Provides JSON APIs: /api/sources, /api/ask, /api/generate
 
 const http = require('http');
+try { require('dotenv').config(); } catch {}
 const { readFileSync, writeFileSync, existsSync, mkdirSync, createReadStream, statSync } = require('fs');
 const { join, resolve, extname } = require('path');
 
@@ -21,7 +22,7 @@ function tryRequire(name) {
 function ensureData() {
   if (!existsSync(DATA_DIR)) mkdirSync(DATA_DIR, { recursive: true });
   if (!existsSync(DATA_FILE)) {
-    writeFileSync(DATA_FILE, JSON.stringify({ sources: [], createdAt: new Date().toISOString() }, null, 2));
+    writeFileSync(DATA_FILE, JSON.stringify({ sources: [], flows: { presets: [] }, settings: {}, jobs: [], createdAt: new Date().toISOString() }, null, 2));
   }
 }
 
@@ -29,9 +30,15 @@ function loadData() {
   ensureData();
   try {
     const raw = readFileSync(DATA_FILE, 'utf8');
-    return JSON.parse(raw);
+    const data = JSON.parse(raw);
+    if (!Array.isArray(data.sources)) data.sources = [];
+    if (!data.flows) data.flows = { presets: [] };
+    if (!Array.isArray(data.flows.presets)) data.flows.presets = [];
+    if (!data.settings) data.settings = {};
+    if (!Array.isArray(data.jobs)) data.jobs = [];
+    return data;
   } catch (e) {
-    return { sources: [] };
+    return { sources: [], flows: { presets: [] }, settings: {}, jobs: [] };
   }
 }
 
@@ -819,6 +826,104 @@ function buildGeneratorPrompt(type, { sources, options = {} }) {
   return { system: sys, user };
 }
 
+function buildGeneratorPromptWithExtraContext(type, { sources, options = {}, extra }) {
+  const base = buildGeneratorPrompt(type, { sources, options });
+  const prefix = extra ? `【上一步上下文】\n${extra}\n\n` : '';
+  return { system: base.system, user: `${prefix}${base.user}` };
+}
+
+function buildFlowSummaryPrompt({ sources, chunks }) {
+  const header = '你是知识蒸馏引擎，需将多来源内容压缩为多层次摘要。';
+  const ctx = (chunks && chunks.length
+    ? chunks.map((c, i) => `片段${i + 1}: ${c.text}`).join('\n')
+    : sources.map((s, i) => `【来源${i + 1}: ${s.name}】\n${s.text.slice(0, 2000)}`).join('\n\n'));
+  const user = `${ctx}\n\n请输出：\n- 摘要（短/中/长）\n- 关键概念（不少于6个）\n- 适合学生/专家/儿童的解释版本`;
+  return { system: header, user };
+}
+
+async function runFlowSteps({ flowId, steps, sources, db, options = {} }) {
+  const result = { id: uid('flow'), steps: [], aggregateCitations: [] };
+  // Prepare relevant chunks for context
+  await ensureChunkEmbeddings(db, sources.flatMap((s) => s.chunks || []));
+  const k = 16;
+  let chunks = null;
+  try {
+    if (pgClient && db.embedding) {
+      const emb = db.embedding ? await embedWithProvider(['总体概览要点'], db.embedding.provider) : await embedBatch(['总体概览要点'], db);
+      const qv = emb.vectors[0];
+      const ids = sources.map((s) => s.id);
+      const rows = await pgQueryTopKByVector(ids, qv, k);
+      if (rows?.length) chunks = rows.map((r, i) => ({ id: r.id, index: i, text: r.text, sourceId: r.sourceId }));
+    } else if (sqliteDB && db.embedding) {
+      const emb = db.embedding ? await embedWithProvider(['总体概览要点'], db.embedding.provider) : await embedBatch(['总体概览要点'], db);
+      const qv = emb.vectors[0];
+      const ids = sources.map((s) => s.id);
+      const rows = sqliteQueryTopKByVector(ids, qv, k);
+      if (rows?.length) chunks = rows.map((r, i) => ({ id: r.id, index: i, text: r.text, sourceId: r.sourceId }));
+    }
+  } catch {}
+  if (!chunks) chunks = retrieveTopChunks('总体概览要点', sources, k);
+
+  // Decide step sequence
+  const seq = steps && steps.length ? steps : (flowId === 'summary_slides_quiz' ? ['summary', 'slides', 'quiz'] : steps || []);
+  let lastText = '';
+  for (const step of seq) {
+    if (step === 'summary') {
+      const { system, user } = buildFlowSummaryPrompt({ sources, chunks });
+      const text = await llmGenerate({ system, user, expect: 'text' });
+      const naive = `【短】${splitSentences(sources.map((s)=>s.text).join('\n'), 2)}\n【中】${splitSentences(sources.map((s)=>s.text).join('\n'), 5)}\n【长】${splitSentences(sources.map((s)=>s.text).join('\n'), 12)}`;
+      const out = text || naive;
+      lastText = out;
+      const cites = pickCitations(sources, 'summary', out, 6);
+      result.steps.push({ id: 'summary', output: { text: out }, citations: cites });
+      result.aggregateCitations.push(...cites);
+      continue;
+    }
+    if (step === 'slides') {
+      const { system, user } = buildGeneratorPromptWithExtraContext('slides', { sources, options: options.slides || {}, extra: lastText });
+      let text = await llmGenerate({ system, user, expect: 'text' });
+      if (!text || text.trim().length < 20) {
+        const mock = mockGenerate('slides', { sources, options: options.slides || {} });
+        text = mock.text;
+      }
+      const cites = pickCitations(sources, 'slides', text, 6);
+      result.steps.push({ id: 'slides', output: { text }, citations: cites });
+      result.aggregateCitations.push(...cites);
+      lastText = text;
+      continue;
+    }
+    if (step === 'quiz') {
+      const { system, user } = buildGeneratorPromptWithExtraContext('quiz', { sources, options: options.quiz || {}, extra: lastText });
+      let text = await llmGenerate({ system, user, expect: 'text' });
+      if (!text || text.trim().length < 20) {
+        const mock = mockGenerate('quiz', { sources, options: options.quiz || {} });
+        text = (mock.items || []).map((it,i)=>`[${it.kind}] ${i+1}. ${it.q}\n答案：${Array.isArray(it.answer)?it.answer.join(', '):it.answer}\n解释：${it.explain}`).join('\n\n');
+      }
+      const cites = pickCitations(sources, 'quiz', text, 6);
+      result.steps.push({ id: 'quiz', output: { text }, citations: cites });
+      result.aggregateCitations.push(...cites);
+      lastText = text;
+      continue;
+    }
+    // Fallback: use /api/generate types
+    const { system, user } = buildGeneratorPromptWithExtraContext(step, { sources, options: options[step] || {}, extra: lastText });
+    let text = await llmGenerate({ system, user, expect: 'text' });
+    if (!text || text.trim().length < 20) {
+      const mock = mockGenerate(step, { sources, options: options[step] || {} });
+      text = typeof mock.text === 'string' ? mock.text : JSON.stringify(mock, null, 2);
+    }
+    const cites = pickCitations(sources, step, text, 6);
+    result.steps.push({ id: step, output: { text }, citations: cites });
+    result.aggregateCitations.push(...cites);
+    lastText = text;
+  }
+  // Deduplicate citations by sourceId + snippet
+  const seen = new Set();
+  result.aggregateCitations = result.aggregateCitations.filter((c)=>{ const k = c.sourceId + '|' + c.snippet; if (seen.has(k)) return false; seen.add(k); return true; });
+  result.sources = sources.map((s)=>({ id: s.id, name: s.name }));
+  return result;
+}
+
 // Mock generators to ensure offline usability
 function mockGenerate(type, { sources, options }) {
   const title = options?.title || (sources[0]?.name || '概览');
@@ -921,6 +1026,22 @@ const server = http.createServer(async (req, res) => {
 
     // API: sources
     if (req.method === 'GET' && path === '/api/health') return ok(res, { ok: true });
+    if (req.method === 'GET' && path === '/api/meta') {
+      let version = '0.0.0';
+      try {
+        const rootPkg = JSON.parse(readFileSync(resolve(__dirname, '../../package.json'), 'utf8'));
+        version = rootPkg.version || version;
+      } catch {}
+      return ok(res, {
+        version,
+        vectorBackend: pgClient ? 'pgvector' : (sqliteDB ? 'sqlite' : 'memory'),
+        embedding: db?.embedding || null,
+        env: {
+          OPENAI: !!process.env.OPENAI_API_KEY,
+          GEMINI: !!process.env.GOOGLE_GENAI_API_KEY,
+        },
+      });
+    }
 
     if (path.startsWith('/api/')) {
       const db = loadData();
@@ -1141,6 +1262,101 @@ const server = http.createServer(async (req, res) => {
         return ok(res, { type, text: llmOut, citations });
       }
 
+      // Flows and presets
+      if (req.method === 'GET' && path === '/api/flows') {
+        const builtins = [
+          { id: 'summary_slides_quiz', name: '摘要 → PPT → 测验', steps: ['summary','slides','quiz'] },
+        ];
+        return ok(res, { flows: builtins, presets: db.flows.presets || [] });
+      }
+
+      if (req.method === 'POST' && path === '/api/flows/run') {
+        const { flowId, steps, sourceIds, options } = await readJson(req).catch(() => ({}));
+        const sources = findSources(db, sourceIds);
+        if (!sources.length) return bad(res, 'No sources selected');
+        const out = await runFlowSteps({ flowId, steps, sources, db, options });
+        return ok(res, out);
+      }
+
+      if (req.method === 'GET' && path === '/api/settings') {
+        return ok(res, db.settings || {});
+      }
+
+      if (req.method === 'POST' && path === '/api/settings') {
+        const body = await readJson(req).catch(() => ({}));
+        db.settings = { ...(db.settings || {}), ...(body || {}) };
+        saveData(db);
+        return ok(res, db.settings);
+      }
+
+      if (req.method === 'GET' && path === '/api/flows/presets') {
+        return ok(res, { presets: db.flows.presets || [] });
+      }
+
+      if (req.method === 'POST' && path === '/api/flows/presets') {
+        const body = await readJson(req).catch(() => ({}));
+        if (!body || !body.name) return bad(res, 'Missing name');
+        const preset = { id: uid('preset'), name: body.name, steps: body.steps || ['summary','slides','quiz'], options: body.options || {}, createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() };
+        db.flows.presets = db.flows.presets || [];
+        db.flows.presets.push(preset);
+        saveData(db);
+        return ok(res, { preset });
+      }
+
+      if (req.method === 'PUT' && path.startsWith('/api/flows/presets/')) {
+        const id = path.split('/').pop();
+        const body = await readJson(req).catch(() => ({}));
+        const list = db.flows.presets || [];
+        const idx = list.findIndex((p) => p.id === id);
+        if (idx === -1) return notFound(res);
+        list[idx] = { ...list[idx], ...body, id, updatedAt: new Date().toISOString() };
+        saveData(db);
+        return ok(res, { preset: list[idx] });
+      }
+
+      if (req.method === 'DELETE' && path.startsWith('/api/flows/presets/')) {
+        const id = path.split('/').pop();
+        const list = db.flows.presets || [];
+        const idx = list.findIndex((p) => p.id === id);
+        if (idx === -1) return notFound(res);
+        const removed = list.splice(idx, 1)[0];
+        saveData(db);
+        return ok(res, { removed });
+      }
+
+      if (req.method === 'POST' && path === '/api/flows/run-batch') {
+        const { jobs, sequential = true } = await readJson(req).catch(() => ({}));
+        if (!Array.isArray(jobs) || jobs.length === 0) return bad(res, 'Missing jobs');
+        const batchId = uid('batch');
+        const results = [];
+        for (const j of jobs) {
+          const preset = j.presetId ? (db.flows.presets || []).find((p) => p.id === j.presetId) : null;
+          const steps = j.steps || preset?.steps || undefined;
+          const options = j.options || preset?.options || {};
+          const sources = findSources(db, j.sourceIds);
+          const out = await runFlowSteps({ flowId: j.flowId || (preset ? 'preset' : undefined), steps, sources, db, options });
+          const job = { id: uid('job'), batchId, status: 'completed', createdAt: new Date().toISOString(), result: out };
+          db.jobs.push(job);
+          results.push(job);
+          if (!sequential) {
+            // In demo, still sequential
+          }
+        }
+        saveData(db);
+        return ok(res, { batchId, results });
+      }
+
+      if (req.method === 'GET' && path === '/api/jobs') {
+        return ok(res, { jobs: db.jobs.slice(-100) });
+      }
+
+      if (req.method === 'GET' && path.startsWith('/api/jobs/')) {
+        const id = path.split('/').pop();
+        const job = (db.jobs || []).find((j) => j.id === id);
+        if (!job) return notFound(res);
+        return ok(res, job);
+      }
+
       return notFound(res);
     }
 
@@ -1175,3 +1391,13 @@ server.listen(PORT, () => {
     console.log(`NotebookLM-like server running at http://localhost:${PORT}`);
   })();
 });
+
+// Basic process-level error logging
+process.on('unhandledRejection', (err) => {
+  try { console.error('[unhandledRejection]', err?.stack || err); } catch {}
+});
+process.on('uncaughtException', (err) => {
+  try { console.error('[uncaughtException]', err?.stack || err); } catch {}
+});
+
+// (moved misplaced route handlers into the /api/ block above)
