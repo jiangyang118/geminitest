@@ -1,0 +1,88 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>NotebookLM-style 知识空间</title>
+  <link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">NotebookLM-style</div>
+    <div class="status" id="status">就绪</div>
+  </header>
+  <main class="layout">
+    <aside class="sidebar">
+      <section>
+        <h2>来源 Sources</h2>
+        <div class="source-form">
+          <label>名称 <input id="src-name" placeholder="例如：产品文档" /></label>
+          <label>类型
+            <select id="src-type">
+              <option value="text">文本</option>
+              <option value="url">网页URL</option>
+              <option value="pdf">PDF(占位)</option>
+            </select>
+          </label>
+          <label id="content-wrap"><textarea id="src-content" rows="6" placeholder="在此粘贴文本内容"></textarea></label>
+          <label id="url-wrap" style="display:none;"><input id="src-url" placeholder="https://..." /></label>
+          <label>或上传文件（txt/md/srt/vtt/csv）
+            <input id="file-input" type="file" accept=".txt,.md,.srt,.vtt,.csv,.json" />
+          </label>
+          <button id="btn-add-src">添加来源</button>
+        </div>
+        <div class="source-list" id="source-list"></div>
+      </section>
+    </aside>
+
+    <section class="content">
+      <section class="card">
+        <h2>AI 深度问答 Ask AI</h2>
+        <div class="ask">
+          <textarea id="question" placeholder="输入你的问题...（将自动引用所选来源）" rows="3"></textarea>
+          <div class="ask-actions">
+            <button id="btn-ask">提问</button>
+            <button id="btn-copy-answer">复制回答</button>
+            <span>已选来源：<span id="selected-count">0</span></span>
+          </div>
+        </div>
+        <div id="answer" class="answer"></div>
+      </section>
+
+      <section class="card">
+        <h2>生成器 Generators</h2>
+        <div class="gen-actions">
+          <button data-type="audio_overview">音频概览</button>
+          <button data-type="video_overview">视频概览</button>
+          <button data-type="mind_map">思维导图</button>
+          <button data-type="report">结构化报告</button>
+          <button data-type="flashcards">闪卡</button>
+          <button data-type="quiz">测验</button>
+          <button data-type="slides">PPT 大纲</button>
+        </div>
+        <div class="ask-actions" style="margin-top:6px">
+          <button id="btn-copy-gen">复制生成内容</button>
+          <button id="btn-dl-gen">下载为 Markdown</button>
+        </div>
+        <div id="gen-output" class="gen-output"></div>
+      </section>
+    </section>
+  </main>
+
+  <script src="/app.js"></script>
+  <script>
+    // toggle inputs by type
+    const typeSel = document.getElementById('src-type');
+    const urlWrap = document.getElementById('url-wrap');
+    const contentWrap = document.getElementById('content-wrap');
+    typeSel.addEventListener('change', () => {
+      const v = typeSel.value;
+      urlWrap.style.display = v === 'url' ? '' : 'none';
+      contentWrap.style.display = v === 'url' ? 'none' : '';
+    });
+  </script>
+</body>
+<!-- 输出规范：
+1) 结构清晰；2) 引用来源；3) 可复制；4) 提供可选版本；5) 可扩展。
+-->
+</html>

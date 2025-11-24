@@ -1,0 +1,14 @@
+{
+  "name": "notebooklm-web",
+  "private": true,
+  "version": "0.1.0",
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "dev": "node apps/server/index.js",
+    "build": "echo 'Run per-package builds'",
+    "start": "node apps/server/index.js"
+  }
+}
