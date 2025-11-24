@@ -25,8 +25,18 @@ async function loadPresets() {
       const opt = document.createElement('option');
       opt.value = p.id; opt.textContent = p.name; sel.appendChild(opt);
     });
-    // store built-in flows for later default selection
-    window.__builtinFlows = r.flows || [];
+    // populate flows
+    const flowSel = document.getElementById('flow-id');
+    if (flowSel) {
+      const current = flowSel.value;
+      flowSel.innerHTML = '';
+      (r.flows || []).forEach(f => {
+        const opt = document.createElement('option');
+        opt.value = f.id; opt.textContent = f.name || f.id; flowSel.appendChild(opt);
+      });
+      if (current) flowSel.value = current;
+    }
+    window.__flows = r.flows || [];
   }catch(e){ /* ignore */ }
 }
 
@@ -140,6 +150,16 @@ $('#btn-ask').addEventListener('click', ask);
 $('#source-list').addEventListener('change', (e) => { if (e.target.classList.contains('pick-src')) updateSelectedCount(); });
 $$('.gen-actions button').forEach((b)=> b.addEventListener('click', ()=> generate(b.getAttribute('data-type'))));
 $('#btn-run-flow').addEventListener('click', runFlow);
+document.getElementById('flow-id').addEventListener('change', ()=>{
+  const id = document.getElementById('flow-id').value;
+  const flows = window.__flows || [];
+  const f = flows.find(x => x.id === id);
+  if (f && Array.isArray(f.steps)) {
+    const steps = f.steps.map(s => typeof s === 'string' ? s : (s.type || '')).filter(Boolean);
+    const inp = document.getElementById('steps-input');
+    if (inp) inp.value = steps.join(',');
+  }
+});
 $('#btn-run-steps').addEventListener('click', runSteps);
 $('#btn-copy-flow').addEventListener('click', ()=> copyText($('#flow-output')));
 $('#btn-dl-flow').addEventListener('click', ()=>{

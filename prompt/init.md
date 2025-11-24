@@ -104,3 +104,328 @@
 4) Flow：
   任务：对已选来源运行“摘要→PPT→测验”，将摘要要点融入 PPT 与测验中，并统一汇总引用。
  
+
+
+好的师兄，我听懂你的意思了：
+你要的是：把整个 NotebookLM 全栈系统的每一个 Flow（流程）都拆成“可直接喂给 Codex 的微型 Prompt”，细化到可以单独生成某一个模块。
+
+也就是说：
+	•	Flow = 任务步骤
+	•	每个 Flow = 一个独立可执行的 Prompt
+	•	每个 Prompt = 可以直接让 Codex 生成一个模块，无需你自己拆
+
+我将按照企业级工程标准，把 NotebookLM 的全链路拆成 11 个核心 Flow，并为每个 Flow 输出 “可直接喂给 Codex 的 Prompt”。
+
+下面开始。
+
+⸻
+
+📌 NotebookLM 全栈系统 — Flow 级 Prompt（可直接喂 Codex）
+
+共 11 个 Flow，每个都是独立可执行 Prompt。
+你可以逐个执行，也可以让 Codex 一口气执行所有。
+
+⸻
+
+Flow 1：项目初始化（项目结构自动生成 Prompt）
+
+Prompt：Initialize Project
+
+你是一名高级全栈架构师，请为我创建一个名为 notebooklm-ai 的项目脚手架。
+必须严格按照以下文件结构生成空文件：
+
+notebooklm-ai/
+│── backend/
+│   ├── server.js
+│   ├── config.js
+│   ├── openai.js
+│   ├── vectordb/
+│   │      ├── milvusClient.js
+│   │      ├── pgvectorClient.js
+│   │      ├── chromaClient.js
+│   │      └── qdrantClient.js
+│   ├── controllers/
+│   ├── services/
+│   ├── routes/
+│   └── models/
+│
+│── frontend/
+│   ├── index.html
+│   ├── main.js
+│   ├── style.css
+│
+└── README.md
+
+所有文件先生成空壳，内含注释说明职责。
+
+
+⸻
+
+Flow 2：后端主服务器（Express + CORS + Routing）
+
+Prompt：Generate Backend Server
+
+请填充 backend/server.js，实现：
+
+1. 创建 Express app
+2. 启动端口 3001
+3. 使用 CORS、JSON、static
+4. 加载路由：chatRoutes / docRoutes
+5. 加载配置文件 config.js
+6. 打印启动信息
+
+代码必须可直接运行
+依赖必须写在注释里。
+
+
+⸻
+
+Flow 3：OpenAI SDK 封装（真实 API 调用）
+
+Prompt：Generate OpenAI Wrapper
+
+请生成 backend/openai.js 文件：
+- 使用 openai 官方 SDK
+- 封装 chat、embedding、tts 三类方法
+- model 名称从 env 读取
+- 提供 3 个导出函数：
+  generateChat(messages)
+  generateEmbedding(text)
+  generateTTS(text)
+
+所有异常必须 console.error 打印。
+
+
+⸻
+
+Flow 4：向量数据库四选一（PgVector / Milvus / Chroma / Qdrant）
+
+Prompt：Generate VectorDB Clients
+
+请在 backend/vectordb/ 目录下完成 4 个文件：
+
+milvusClient.js
+pgvectorClient.js
+chromaClient.js
+qdrantClient.js
+
+要求每个文件导出以下统一接口：
+
+init()
+insertEmbedding({doc_id, paragraph_index, content, embedding})
+search(queryEmbedding, top_k)
+
+内部逻辑：
+- PgVector：使用 pg + hnsw/ivfflat
+- Milvus：使用 IVF_FLAT
+- Chroma：本地文件方式
+- Qdrant：使用 HNSW
+
+所有模块必须遵守统一接口签名。
+
+
+⸻
+
+Flow 5：文档模型 & 数据库初始化（SQLite / PostgreSQL 可切换）
+
+Prompt：Generate DB Models
+
+请生成 backend/models/db.js：
+- 支持 SQLite 和 PostgreSQL 自动切换
+- 从 env.DB_TYPE 读取类型
+- 输出一个 db 实例
+
+文档表 Document：
+id, title, type, content, created_at
+
+embedding 表（若使用 SQLite）：
+id, doc_id, paragraph_index, content, vector(JSON)
+
+请生成 Document.js Embedding.js 两个 ORM 模块。
+
+
+⸻
+
+Flow 6：文档上传与解析（PDF/TXT/MD）
+
+Prompt：Generate Doc Upload Flow
+
+请生成 docRoutes.js + docController.js + docService.js 文件，完成：
+
+POST /api/docs/upload
+功能：
+1. 接收文件（multer）
+2. 识别文件类型（pdf/md/txt）
+3. 调用解析函数 parseDocument()
+4. 将文档 content 存入数据库
+5. 返回 doc_id
+
+注意：
+- PDF 可用 mock，写：内容来自 PDF，长度为 XX。
+- parseDocument() 要单独封装在 docService.js 中。
+
+
+⸻
+
+Flow 7：文档切片（Chunking）
+
+Prompt：Generate Document Chunker
+
+请在 docService.js 中生成名为 chunkDocument(content) 的方法：
+
+规则：
+max_chars_per_chunk = 800
+overlap = 100
+
+返回：
+[
+  { index:0, text: "..." },
+  { index:1, text: "..." }
+]
+
+要求逻辑清晰、可复用。
+
+
+⸻
+
+Flow 8：文档 Embedding（OpenAI embedding-3-large）
+
+Prompt：Generate Embedding Pipeline
+
+请在 docController.js 和 vectorService.js 添加文档向量化流程：
+
+流程：
+1. 调用 chunkDocument(content)
+2. 对每段 text 调用 generateEmbedding()
+3. 将 embedding 存入向量库（根据 VECTOR_DB 动态切换）
+4. endpoints:
+   POST /api/docs/embed/:doc_id
+
+返回处理段数。
+
+要求可直接运行。
+
+
+⸻
+
+Flow 9：向量检索（RAG 检索模块）
+
+Prompt：Generate Vector Search API
+
+请生成 POST /api/docs/search：
+
+流程：
+1. 使用 generateEmbedding(query) 得到 queryEmbedding
+2. 调用 vectorDB.search(queryEmbedding, top_k)
+3. 返回统一格式：
+[
+  {
+    doc_id,
+    paragraph_index,
+    content,
+    score
+  }
+]
+
+
+⸻
+
+Flow 10：Chat（RAG + Chat Completion）
+
+Prompt：Generate ChatController
+
+请生成 chatController.js：
+
+接口：
+POST /api/chat { query }
+
+流程：
+1. 调用 /api/docs/search → 得到 top3 段落
+2. 构建 RAG Prompt：
+
+“你是一名专业 AI 助手。以下是文档片段：
+[1]...
+[2]...
+[3]...
+请基于这些信息回答用户问题，不要编造。”
+
+3. 调用 generateChat(messages)（GPT-4.1 / GPT-5）
+4. 返回 answer + citations
+
+要求：
+- citations 字段必须返回引用段落。
+
+
+⸻
+
+Flow 11：多模态生成器（摘要 / 音频 / 视频 / PPT / 思维导图）
+
+Prompt：Generate Multi-modal APIs
+
+请生成 backend/routes/generateRoutes.js 和 controllers/generateController.js：
+
+必须实现以下真实模型调用：
+
+POST /api/generate/summary
+POST /api/generate/audio
+POST /api/generate/video
+POST /api/generate/mindmap
+POST /api/generate/flashcards
+POST /api/generate/quiz
+POST /api/generate/ppt
+
+输出格式：
+summary: string
+audio: { base64Audio }
+video: { script: [...] }
+mindmap: { nodes:[], edges:[] }
+flashcards: [{q,a}]
+quiz: [{question, choices, answer}]
+ppt: { slides: [...] }
+
+调用模型：
+- summary/flashcards/quiz/ppt → GPT-4.1
+- audio → gpt-4o-mini-tts
+- mindmap/video → GPT-4.1 或 o1-mini
+
+
+⸻
+
+Flow 12：前端 NotebookLM UI（Vue3 + Token 风格）
+
+Prompt：Generate Frontend (Vue3 + CDN)
+
+请生成 frontend/index.html + main.js + style.css 实现：
+
+1. NotebookLM 三栏布局
+2. 左侧文档列表（调用 /api/docs/list）
+3. 中间文档 viewer（调用 /api/docs/:id）
+4. 多模态生成器按钮组（调用 backend APIs）
+5. 右侧 Chat Panel（调用 /api/chat）
+6. Modal 展示思维导图 / PPT
+7. 所有 UI 组件遵循 Version 2.5 Token 体系
+
+必须可直接运行。
+
+
+⸻
+
+Flow 13：README（运行说明）
+
+Prompt：Generate README
+
+请生成 README.md：
+
+内容必须包括：
+- 项目简介
+- 技术栈
+- 环境变量
+- 如何运行 backend
+- 如何运行 frontend
+- 如何切换向量库（PgVector / Milvus / Chroma / Qdrant）
+- 如何切换模型（GPT-4.1 / GPT-5 / o1 / o3-mini）
+- 生产部署方案（Node + Nginx + PM2）
+
+
+⸻
+ 

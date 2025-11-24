@@ -43,6 +43,20 @@ function systemHeader(extra) {
   return [SYSTEM_PROMPT_TEXT, extra].filter(Boolean).join('\n\n');
 }
 
+// Flows registry
+const FLOWS_PATH = resolve(__dirname, '../../prompt/flows.json');
+function loadFlowsRegistry() {
+  try {
+    const raw = readFileSync(FLOWS_PATH, 'utf8');
+    const data = JSON.parse(raw);
+    if (!Array.isArray(data.flows)) return [];
+    return data.flows;
+  } catch (e) {
+    return [];
+  }
+}
+let FLOWS_REGISTRY = loadFlowsRegistry();
+
 function loadData() {
   ensureData();
   try {
@@ -442,6 +456,26 @@ function cosineVec(a, b) {
   return na && nb ? dot / Math.sqrt(na * nb) : 0;
 }
 
+// Simple LRU cache for single-text embeddings
+const EMB_CACHE = new Map();
+const EMB_CACHE_MAX = 200;
+async function cachedEmbedSingle(text, dbOrProvider) {
+  const provider = typeof dbOrProvider === 'string' ? dbOrProvider : (dbOrProvider?.embedding?.provider || 'local-hash-3gram');
+  const key = provider + '::' + (text || '').slice(0, 512);
+  if (EMB_CACHE.has(key)) {
+    const val = EMB_CACHE.get(key);
+    EMB_CACHE.delete(key); EMB_CACHE.set(key, val);
+    return val;
+  }
+  const emb = await (dbOrProvider?.embedding ? embedWithProvider([text], provider) : embedWithProvider([text], provider));
+  const vec = emb.vectors[0];
+  EMB_CACHE.set(key, vec);
+  if (EMB_CACHE.size > EMB_CACHE_MAX) {
+    const first = EMB_CACHE.keys().next().value; EMB_CACHE.delete(first);
+  }
+  return vec;
+}
+
 // Ingestion: naive chunking and metadata
 function ingestSource(data, { type, name, content, url, meta }) {
   const now = new Date().toISOString();
@@ -666,9 +700,10 @@ function retrieveTopChunksVector(query, sources, db, k = 12) {
   const chunks = sources.flatMap((s) => s.chunks || []);
   if (!db.embedding || chunks.length === 0 || !chunks[0].vector) return null;
   return (async () => {
-    const emb = db.embedding ? await embedWithProvider([query], db.embedding.provider) : await embedBatch([query], db);
-    const { vectors, dim } = emb;
-    const qv = vectors[0];
+    const provider = db.embedding?.provider;
+    const emb = db.embedding ? await embedWithProvider([query], provider) : await embedBatch([query], db);
+    const { dim } = emb;
+    const qv = db.embedding ? await cachedEmbedSingle(query, provider) : emb.vectors[0];
     const scored = chunks
       .filter((c) => Array.isArray(c.vector) && c.vector.length === (db.embedding?.dim || dim))
       .map((c) => ({ c, score: cosineVec(c.vector, qv) }));
@@ -884,7 +919,9 @@ async function runFlowSteps({ flowId, steps, sources, db, options = {} }) {
   // Decide step sequence
   const seq = steps && steps.length ? steps : (flowId === 'summary_slides_quiz' ? ['summary', 'slides', 'quiz'] : steps || []);
   let lastText = '';
-  for (const step of seq) {
+  for (const raw of seq) {
+    const step = typeof raw === 'string' ? raw : (raw?.type || '');
+    const sopts = typeof raw === 'object' && raw ? (raw.options || {}) : {};
     if (step === 'summary') {
       const { system, user } = buildFlowSummaryPrompt({ sources, chunks });
       const text = await llmGenerate({ system, user, expect: 'text' });
@@ -897,10 +934,11 @@ async function runFlowSteps({ flowId, steps, sources, db, options = {} }) {
       continue;
     }
     if (step === 'slides') {
-      const { system, user } = buildGeneratorPromptWithExtraContext('slides', { sources, options: options.slides || {}, extra: lastText });
+      const merged = { ...(options.slides || {}), ...(sopts || {}) };
+      const { system, user } = buildGeneratorPromptWithExtraContext('slides', { sources, options: merged, extra: lastText });
       let text = await llmGenerate({ system, user, expect: 'text' });
       if (!text || text.trim().length < 20) {
-        const mock = mockGenerate('slides', { sources, options: options.slides || {} });
+        const mock = mockGenerate('slides', { sources, options: merged });
         text = mock.text;
       }
       const cites = pickCitations(sources, 'slides', text, 6);
@@ -910,10 +948,11 @@ async function runFlowSteps({ flowId, steps, sources, db, options = {} }) {
       continue;
     }
     if (step === 'quiz') {
-      const { system, user } = buildGeneratorPromptWithExtraContext('quiz', { sources, options: options.quiz || {}, extra: lastText });
+      const merged = { ...(options.quiz || {}), ...(sopts || {}) };
+      const { system, user } = buildGeneratorPromptWithExtraContext('quiz', { sources, options: merged, extra: lastText });
       let text = await llmGenerate({ system, user, expect: 'text' });
       if (!text || text.trim().length < 20) {
-        const mock = mockGenerate('quiz', { sources, options: options.quiz || {} });
+        const mock = mockGenerate('quiz', { sources, options: merged });
         text = (mock.items || []).map((it,i)=>`[${it.kind}] ${i+1}. ${it.q}\n答案：${Array.isArray(it.answer)?it.answer.join(', '):it.answer}\n解释：${it.explain}`).join('\n\n');
       }
       const cites = pickCitations(sources, 'quiz', text, 6);
@@ -923,10 +962,11 @@ async function runFlowSteps({ flowId, steps, sources, db, options = {} }) {
       continue;
     }
     // Fallback: use /api/generate types
-    const { system, user } = buildGeneratorPromptWithExtraContext(step, { sources, options: options[step] || {}, extra: lastText });
+    const merged = { ...(options[step] || {}), ...(sopts || {}) };
+    const { system, user } = buildGeneratorPromptWithExtraContext(step, { sources, options: merged, extra: lastText });
     let text = await llmGenerate({ system, user, expect: 'text' });
     if (!text || text.trim().length < 20) {
-      const mock = mockGenerate(step, { sources, options: options[step] || {} });
+      const mock = mockGenerate(step, { sources, options: merged });
       text = typeof mock.text === 'string' ? mock.text : JSON.stringify(mock, null, 2);
     }
     const cites = pickCitations(sources, step, text, 6);
@@ -1178,20 +1218,23 @@ const server = http.createServer(async (req, res) => {
         const sources = findSources(db, sourceIds);
         // Ensure embeddings for selected sources (if possible)
         await ensureChunkEmbeddings(db, sources.flatMap((s) => s.chunks || []));
-        const k = Math.max(4, Math.min(32, topK || 12));
+        const defaultTopK = Math.max(4, Math.min(32, (db.settings?.defaultTopK || 12)));
+        const k = Math.max(4, Math.min(32, topK || defaultTopK));
         let chunks = null;
         // Prefer DB-backed vector search (pgvector → sqlite)
         if (pgClient && db.embedding) {
-          const emb = db.embedding ? await embedWithProvider([question], db.embedding.provider) : await embedBatch([question], db);
-          const qv = emb.vectors[0];
+          const provider = db.embedding?.provider;
+          const emb = db.embedding ? await embedWithProvider([question], provider) : await embedBatch([question], db);
+          const qv = db.embedding ? await cachedEmbedSingle(question, provider) : emb.vectors[0];
           const ids = sources.map((s) => s.id);
           const rows = await pgQueryTopKByVector(ids, qv, k);
           if (rows && rows.length) {
             chunks = rows.map((r, i) => ({ id: r.id, index: i, text: r.text, sourceId: r.sourceId }));
           }
         } else if (sqliteDB && db.embedding) {
-          const emb = db.embedding ? await embedWithProvider([question], db.embedding.provider) : await embedBatch([question], db);
-          const qv = emb.vectors[0];
+          const provider = db.embedding?.provider;
+          const emb = db.embedding ? await embedWithProvider([question], provider) : await embedBatch([question], db);
+          const qv = db.embedding ? await cachedEmbedSingle(question, provider) : emb.vectors[0];
           const ids = sources.map((s) => s.id);
           const rows = sqliteQueryTopKByVector(ids, qv, k);
           if (rows && rows.length) {
@@ -1290,15 +1333,29 @@ const server = http.createServer(async (req, res) => {
         const builtins = [
           { id: 'summary_slides_quiz', name: '摘要 → PPT → 测验', steps: ['summary','slides','quiz'] },
         ];
-        return ok(res, { flows: builtins, presets: db.flows.presets || [] });
+        // Merge registry flows; prefer registry definitions
+        const ids = new Set(FLOWS_REGISTRY.map(f => f.id));
+        const flows = [...FLOWS_REGISTRY, ...builtins.filter(b => !ids.has(b.id))];
+        return ok(res, { flows, presets: db.flows.presets || [] });
       }
 
       if (req.method === 'POST' && path === '/api/flows/run') {
         const { flowId, steps, sourceIds, options } = await readJson(req).catch(() => ({}));
         const sources = findSources(db, sourceIds);
         if (!sources.length) return bad(res, 'No sources selected');
-        const out = await runFlowSteps({ flowId, steps, sources, db, options });
+        // If flowId in registry and steps not provided, load from registry
+        let useSteps = steps;
+        if ((!steps || steps.length === 0) && flowId) {
+          const reg = FLOWS_REGISTRY.find(f => f.id === flowId);
+          if (reg) useSteps = reg.steps;
+        }
+        const out = await runFlowSteps({ flowId, steps: useSteps, sources, db, options });
         return ok(res, out);
+      }
+
+      if (req.method === 'POST' && path === '/api/flows/reload') {
+        FLOWS_REGISTRY = loadFlowsRegistry();
+        return ok(res, { reloaded: true, count: FLOWS_REGISTRY.length });
       }
 
       if (req.method === 'GET' && path === '/api/settings') {
