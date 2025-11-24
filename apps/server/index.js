@@ -26,6 +26,23 @@ function ensureData() {
   }
 }
 
+// --- System Prompt loading (from prompt/init.md) ---
+const PROMPT_INIT_PATH = resolve(__dirname, '../../prompt/init.md');
+function loadSystemPromptText() {
+  try {
+    let txt = readFileSync(PROMPT_INIT_PATH, 'utf8');
+    // Keep reasonably sized to avoid exceeding model limits in small requests
+    if (txt.length > 120000) txt = txt.slice(0, 120000);
+    return txt;
+  } catch (e) {
+    return '你是NotebookLM-style 知识蒸馏与跨媒体生成引擎。基于来源证据回答，提供短/中/长摘要与学生/专家/儿童版本，所有输出结构清晰并附引用。';
+  }
+}
+let SYSTEM_PROMPT_TEXT = loadSystemPromptText();
+function systemHeader(extra) {
+  return [SYSTEM_PROMPT_TEXT, extra].filter(Boolean).join('\n\n');
+}
+
 function loadData() {
   ensureData();
   try {
@@ -481,7 +498,7 @@ function formatAnswerWithVariants({ base, question, sources, citations }) {
 }
 
 function buildPromptFromSources({ question, sources }) {
-  const header = '你是“NotebookLM-style 知识蒸馏引擎”。基于提供的资料，给出严谨回答并附引用标注。先短再中再长总结。';
+  const header = systemHeader('基于提供的资料，给出严谨回答并附引用标注。先短再中再长总结，并提供学生/专家/儿童版本。');
   const ctx = sources
     .map((s, i) => `【来源${i + 1}: ${s.name} (${s.type})】\n${s.text.slice(0, 4000)}`)
     .join('\n\n');
@@ -490,7 +507,7 @@ function buildPromptFromSources({ question, sources }) {
 }
 
 function buildPromptFromContexts({ question, chunks, sources }) {
-  const header = '你是“NotebookLM-style 知识蒸馏引擎”。请严格基于提供片段进行回答并标注依据。先短再中再长总结。';
+  const header = systemHeader('严格基于提供片段进行回答并标注依据；先短再中再长总结，并提供不同受众版本。');
   const bySource = new Map();
   for (const ch of chunks) {
     const s = sources.find((x) => x.id === ch.sourceId);
@@ -812,7 +829,7 @@ function buildGeneratorPrompt(type, { sources, options = {} }) {
   const base = sources
     .map((s, i) => `【来源${i + 1}: ${s.name}】\n${s.text.slice(0, 4000)}`)
     .join('\n\n');
-  const sys = '你是跨媒体生成器与教学设计专家。输出严格遵循所需结构，且标注来源引用片段。全部使用中文。';
+  const sys = systemHeader('跨媒体生成器与教学设计专家；输出严格遵循所需结构，标注来源引用片段；使用中文。');
   const reqs = {
     audio_overview: `生成音频概览：\n- 封面标题\n- 章节结构\n- 讲解稿（可直接朗读）\n- 时长估计\n- 可选多语言版本（如需要）`,
     video_overview: `生成视频概览：\n- 视频脚本（含旁白）\n- 镜头脚本（镜头语言）\n- 视频结构大纲\n- 视觉素材建议\n- 时间轴（Timeline）`,
@@ -833,7 +850,7 @@ function buildGeneratorPromptWithExtraContext(type, { sources, options = {}, ext
 }
 
 function buildFlowSummaryPrompt({ sources, chunks }) {
-  const header = '你是知识蒸馏引擎，需将多来源内容压缩为多层次摘要。';
+  const header = systemHeader('将多来源内容压缩为多层次摘要与关键概念，并给出不同受众版本。');
   const ctx = (chunks && chunks.length
     ? chunks.map((c, i) => `片段${i + 1}: ${c.text}`).join('\n')
     : sources.map((s, i) => `【来源${i + 1}: ${s.name}】\n${s.text.slice(0, 2000)}`).join('\n\n'));
@@ -1040,7 +1057,13 @@ const server = http.createServer(async (req, res) => {
           OPENAI: !!process.env.OPENAI_API_KEY,
           GEMINI: !!process.env.GOOGLE_GENAI_API_KEY,
         },
+        systemPromptBytes: (SYSTEM_PROMPT_TEXT || '').length,
       });
+    }
+
+    if (req.method === 'POST' && path === '/api/prompts/reload') {
+      SYSTEM_PROMPT_TEXT = loadSystemPromptText();
+      return ok(res, { reloaded: true, systemPromptBytes: (SYSTEM_PROMPT_TEXT || '').length });
     }
 
     if (path.startsWith('/api/')) {
